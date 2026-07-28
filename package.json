@@ -1,0 +1,93 @@
+{
+  "name": "rayon-ts",
+  "version": "0.1.0",
+  "description": "Rayon-like data parallelism for Node.js: a Vite plugin that compiles \"use parallel\" functions to worker_threads kernels with SharedArrayBuffer + Atomics",
+  "type": "module",
+  "license": "MIT",
+  "author": "inaridiy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inaridiy/rayon-ts.git"
+  },
+  "homepage": "https://github.com/inaridiy/rayon-ts#readme",
+  "bugs": {
+    "url": "https://github.com/inaridiy/rayon-ts/issues"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./vite": {
+      "types": "./dist/plugin/index.d.ts",
+      "import": "./dist/plugin/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime/registry.d.ts",
+      "import": "./dist/runtime/registry.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:worker": "node scripts/build-worker.mjs",
+    "check:generated": "node scripts/build-worker.mjs --check",
+    "build": "npm run build:worker && node scripts/build.mjs && tsc -p tsconfig.build.json",
+    "test": "npm run build:worker && vitest run",
+    "test:coverage": "npm run build:worker && vitest run --coverage",
+    "typecheck": "npm run build:worker && tsc --noEmit",
+    "lint": "oxlint src tests scripts examples vitest.config.ts",
+    "check:dead": "knip",
+    "check:types-compat": "npm run build && node node_modules/typescript-compat/bin/tsc -p tests/compat/tsconfig.json",
+    "check:package": "npm run build && node node_modules/typescript-compat/bin/tsc -p tests/compat/tsconfig.json && publint && attw --pack . --profile esm-only && node scripts/check-package.mjs",
+    "check": "npm run check:generated && npm run lint && npm run typecheck && npm run test:coverage && npm run check:dead && npm run check:package",
+    "prepack": "npm run build",
+    "bench": "npm run build:worker && node --import tsx examples/mandelbrot/run.mjs",
+    "bench:cpu": "npm run build:worker && node --import tsx examples/bench/run.mjs"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.1",
+    "magic-string": "^1.1.0",
+    "oxc-parser": "^0.141.0",
+    "oxc-transform": "^0.141.0"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@types/node": "^26.1.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "knip": "^6.29.0",
+    "oxlint": "^1.76.0",
+    "publint": "^0.3.22",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2",
+    "typescript-compat": "npm:typescript@5.7.3",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
+  },
+  "packageManager": "pnpm@11.1.2",
+  "keywords": [
+    "rayon",
+    "parallel",
+    "worker-threads",
+    "vite-plugin",
+    "sharedarraybuffer",
+    "atomics",
+    "data-parallelism"
+  ],
+  "peerDependencies": {
+    "vite": ">=6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
+  }
+}

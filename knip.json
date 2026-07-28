@@ -1,0 +1,29 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "src/index.ts",
+    "src/plugin/index.ts",
+    "src/runtime/registry.ts",
+    "src/worker/main.ts",
+    "scripts/*.mjs",
+    "examples/*/run.mjs",
+    "examples/*/main.ts",
+    "tests/**/*.test.ts",
+    "tests/public-api-types.ts",
+    "tests/compat/consumer.ts",
+    "tests/fixtures/**/*.ts"
+  ],
+  "project": [
+    "src/**/*.ts",
+    "scripts/**/*.mjs",
+    "examples/**/*.{ts,mjs}",
+    "tests/**/*.ts"
+  ],
+  "paths": {
+    "@fixture/*": ["tests/fixtures/app/*"]
+  },
+  "ignoreIssues": {
+    "src/plugin/index.ts": ["duplicates"]
+  },
+  "ignoreExportsUsedInFile": true
+}
