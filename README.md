@@ -32,7 +32,8 @@ console.log(best, await scoreOne(42));
 - SharedArrayBuffer-backed TypedArrays take the zero-copy fast path.
 - Plain arrays carry cyclic Node clone data: BigInt, Date, Map/Set, Error,
   TypedArray, Blob, CryptoKey, KeyObject, X509Certificate, BlockList, Histogram.
-- Static imports referenced inside a kernel are bundled for the worker.
+- Static imports referenced inside kernels are bundled for the worker; kernels
+  using the same import declarations share one dependency bundle.
 
 ## Benchmark snapshot
 
@@ -42,12 +43,13 @@ Node 24.15.0, 8 workers, median of 3 runs (2026-07-28):
 
 | Workload | Sequential | Parallel | Speedup |
 | --- | ---: | ---: | ---: |
-| Mandelbrot 1000x700 | 377 ms | 52 ms | 7.21x |
-| Primes below 3 million | 152 ms | 27 ms | 5.59x |
-| Collatz for 1..2 million | 3278 ms | 431 ms | 7.61x |
+| Mandelbrot 1000x700 | 352 ms | 49 ms | 7.17x |
+| Primes below 3 million | 134 ms | 19 ms | 6.89x |
+| Collatz for 1..2 million | 3146 ms | 419 ms | 7.51x |
 
-Hardware and load change the numbers. Tiny per-item work can be slower (0.26x
-for the suite's trivial sum); batching with `chunks()` made that case 6.66x.
+Hardware and load change the numbers. Tiny per-item work can still be slower
+(0.87x for the suite's trivial sum); batching with `chunks()` made that case
+6.43x.
 See [`examples/bench/main.ts`](examples/bench/main.ts) for every workload.
 
 ## Prerequisites and setup
@@ -107,9 +109,27 @@ Default pool size is `min(availableParallelism() - 1, 8)`; configure larger host
 
 A kernel may use parameters, locals, nested closures, recursion, standard Node/JavaScript globals, captured cloneable data, other kernels, and bindings from static local/npm/`node:` imports. Imported code is resolved and bundled by esbuild during the Vite transform; standard Vite aliases apply transitively. `rayon({ external: [...] })` leaves installed, require-compatible packages for Node to resolve from the deployed output module. Dynamic `import()` is unsupported.
 
+Within each worker, kernels from one transformed module that use the same
+static import declarations share their bundled module instance. Those imports
+initialize when the first matching kernel is compiled, and mutable module state
+is shared by matching kernels in that worker. Imported dependencies must be
+safe to initialize in a worker; their state is not shared with the main thread
+or other workers.
+
 Clone-isolated captures are snapshotted for each dispatch. Cycles, aliases, Map/Set, null prototypes, and kernel references are preserved. SharedArrayBuffer and host clones with shared native state (BlockList, Histogram, shared WebAssembly.Memory) remain live. Custom prototypes, accessors, and non-enumerable properties are not preserved. Non-shared TypedArrays are copied and warn once.
 
-Generic `par(data)` input is cloned once per worker, so memory is `O(input × workers)`. Plain data travels by native structured clone; the slower graph encoding engages only when the input contains kernel references, null-prototype objects, or objects shared with a kernel's captures. Cycles and aliases inside each value graph survive, but aliases between elements processed by different workers are not preserved. Transfer-only input such as MessagePort/FileHandle is rejected before publish. Reduction identities are limited to clone-isolated plain data and cloned per chunk; shared/mutable host objects are rejected. Worker results are cloned, nested Buffer becomes Uint8Array, and ArrayBuffer, MessagePort, FileHandle, Web Streams, and Node-marked AbortSignal are transferred.
+Generic `par(data)` input is cloned once per active worker, so memory is
+`O(input × active workers)`. The runtime only publishes a job to workers that
+can claim one of its chunks. Plain data travels by native structured clone; the
+slower graph encoding engages only when the input contains kernel references,
+null-prototype objects, or objects shared with a kernel's captures. Cycles and
+aliases inside each value graph survive, but aliases between elements processed
+by different workers are not preserved. Transfer-only input such as
+MessagePort/FileHandle is rejected before publish. Reduction identities are
+limited to clone-isolated plain data and cloned per chunk; shared/mutable host
+objects are rejected. Worker results are cloned, nested Buffer becomes
+Uint8Array, and ArrayBuffer, MessagePort, FileHandle, Web Streams, and
+Node-marked AbortSignal are transferred.
 
 The plugin reports source-located errors for captured assignment, outer-kernel
 `this`/`arguments`, `import.meta`, dynamic imports, JSX, async/generator
@@ -118,7 +138,13 @@ itself be a `"use parallel"` kernel.
 
 ## Failure semantics
 
-A kernel exception becomes `KernelRuntimeError` with the worker stack and does not poison the pool. A timeout or infrastructure failure terminates that pool, so late results cannot corrupt a later job. `maxPending` rejects excess batch calls immediately; a failed batch rejects all pending calls. Shared-memory writes are not rolled back; synchronization and data-race freedom are the caller's responsibility. Use `chunksMut()` for disjoint mutable regions.
+A kernel exception becomes `KernelRuntimeError` with the worker stack and does
+not poison the pool. A cooperative worker exit wakes synchronous dispatches
+immediately; a timeout or infrastructure failure terminates that pool, so late
+results cannot corrupt a later job. `maxPending` rejects excess batch calls
+immediately; a failed batch rejects all pending calls. Shared-memory writes are
+not rolled back; synchronization and data-race freedom are the caller's
+responsibility. Use `chunksMut()` for disjoint mutable regions.
 
 ## Architecture
 

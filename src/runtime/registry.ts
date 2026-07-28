@@ -26,6 +26,8 @@ export interface KernelRegistration {
   id: KernelSourceId;
   /** Worker source. Strings remain supported for hand-written test kernels. */
   source: string | KernelSource;
+  /** Named factory when multiple kernels share one bundled source. */
+  factoryName?: string;
   /** Runtime module URL used as the base for external package resolution. */
   resolveFrom?: string;
   /** Snapshots captured bindings from the defining scope at dispatch time. */
@@ -36,6 +38,7 @@ export interface KernelInfo {
   sourceId: KernelSourceId;
   bindingId: KernelBindingId;
   source: KernelSource;
+  factoryName: string | undefined;
   getEnv: () => Record<string, unknown>;
 }
 
@@ -59,6 +62,7 @@ export function __rayonRegister<F extends AnyFn>(fn: F, registration: KernelRegi
       source.format === "bundle" && registration.resolveFrom !== undefined
         ? { ...source, resolveFrom: registration.resolveFrom }
         : source,
+    factoryName: registration.factoryName,
     getEnv: registration.getEnv,
   };
   byFn.set(fn, info);
@@ -108,15 +112,19 @@ export function encodeKernelGraph(
   const seen = new Map<object, number>();
   const cloneLeaves: CloneLeaf[] = [];
   const queue = [...roots];
+  let queueIndex = 0;
 
   const drainKernelQueue = (): void => {
-    while (queue.length > 0) {
-      const info = queue.shift()!;
+    while (queueIndex < queue.length) {
+      const info = queue[queueIndex++]!;
       if (bindings[info.bindingId] !== undefined) continue;
       sources.set(info.sourceId, info.source);
       try {
         bindings[info.bindingId] = {
           sourceId: info.sourceId,
+          ...(info.factoryName === undefined
+            ? {}
+            : { factoryName: info.factoryName }),
           env: encodeValue(
             info.getEnv(),
             "environment",

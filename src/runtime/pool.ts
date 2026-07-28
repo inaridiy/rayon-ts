@@ -197,7 +197,7 @@ export class Pool {
   private readonly ctrl: Int32Array<SharedArrayBuffer>;
   private readonly ports: MessagePort[] = [];
   private readonly workers: Worker[] = [];
-  private readonly sentSources = new Set<KernelSourceId>();
+  private readonly sentSources: Set<KernelSourceId>[];
   private epoch = 0;
   private state: PoolState = "healthy";
   private failure: Error | undefined;
@@ -208,6 +208,7 @@ export class Pool {
     assertPositiveInt(size, "worker pool size");
     this.size = size;
     this.ctrl = new Int32Array(new SharedArrayBuffer(CTRL_LEN * 4));
+    this.sentSources = Array.from({ length: size }, () => new Set());
     try {
       for (let i = 0; i < size; i++) {
         const { port1, port2 } = new MessageChannel();
@@ -251,6 +252,7 @@ export class Pool {
     const deadline = Date.now() + timeoutMs;
     let ready: number;
     while ((ready = Atomics.load(this.ctrl, CTRL.READY)) < this.size) {
+      this.throwIfWorkerExited();
       this.throwIfBroken();
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
@@ -262,6 +264,7 @@ export class Pool {
       }
       Atomics.wait(this.ctrl, CTRL.READY, ready, Math.min(50, remaining));
     }
+    this.throwIfWorkerExited();
   }
 
   dispatch(
@@ -300,24 +303,33 @@ export class Pool {
     targetWorker: number | undefined,
     recordStats: boolean,
   ): ResultMessage[] {
-    const { epoch, deadline, timeoutMs, publishedSourceIds } = this.publish(
+    const {
+      epoch,
+      deadline,
+      timeoutMs,
+      workerIndices,
+      publishedSources,
+    } = this.publish(
       job,
       allSources,
       targetWorker,
     );
+    const expected = workerIndices.length;
     let posted: number;
-    while ((posted = Atomics.load(this.ctrl, CTRL.POSTED)) < this.size) {
+    while ((posted = Atomics.load(this.ctrl, CTRL.POSTED)) < expected) {
+      this.throwIfWorkerExited();
       this.throwIfBroken();
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        const error = this.timeoutError(timeoutMs, posted, job.total);
+        const error = this.timeoutError(timeoutMs, posted, expected, job.total);
         this.breakPool(error);
         throw error;
       }
       Atomics.wait(this.ctrl, CTRL.POSTED, posted, Math.min(250, remaining));
     }
-    const results = this.collectOrBreak(epoch, recordStats);
-    for (const id of publishedSourceIds) this.sentSources.add(id);
+    this.throwIfWorkerExited();
+    const results = this.collectOrBreak(epoch, workerIndices, recordStats);
+    this.recordPublishedSources(publishedSources);
     return results;
   }
 
@@ -361,20 +373,28 @@ export class Pool {
     targetWorker: number | undefined,
     recordStats: boolean,
   ): Promise<ResultMessage[]> {
-    const { epoch, deadline, timeoutMs, publishedSourceIds } = this.publish(
+    const {
+      epoch,
+      deadline,
+      timeoutMs,
+      workerIndices,
+      publishedSources,
+    } = this.publish(
       job,
       allSources,
       targetWorker,
     );
+    const expected = workerIndices.length;
     const heldWorker = this.workers[targetWorker ?? 0];
     heldWorker?.ref();
     try {
       let posted: number;
-      while ((posted = Atomics.load(this.ctrl, CTRL.POSTED)) < this.size) {
+      while ((posted = Atomics.load(this.ctrl, CTRL.POSTED)) < expected) {
+        this.throwIfWorkerExited();
         this.throwIfBroken();
         const remaining = deadline - Date.now();
         if (remaining <= 0) {
-          const error = this.timeoutError(timeoutMs, posted, job.total);
+          const error = this.timeoutError(timeoutMs, posted, expected, job.total);
           this.breakPool(error);
           throw error;
         }
@@ -389,8 +409,9 @@ export class Pool {
     } finally {
       heldWorker?.unref();
     }
-    const results = this.collectOrBreak(epoch, recordStats);
-    for (const id of publishedSourceIds) this.sentSources.add(id);
+    this.throwIfWorkerExited();
+    const results = this.collectOrBreak(epoch, workerIndices, recordStats);
+    this.recordPublishedSources(publishedSources);
     return results;
   }
 
@@ -414,44 +435,60 @@ export class Pool {
     epoch: number;
     deadline: number;
     timeoutMs: number;
-    publishedSourceIds: KernelSourceId[];
+    workerIndices: number[];
+    publishedSources: Array<{
+      workerIndex: number;
+      sourceIds: KernelSourceId[];
+    }>;
   } {
+    this.throwIfWorkerExited();
     this.throwIfBroken();
     const timeoutMs = resolveTimeoutMs();
     this.epoch = this.epoch >= 0x7fff_ffff ? 1 : this.epoch + 1;
     const epoch = this.epoch;
 
-    const sources = Object.create(null) as Record<KernelSourceId, KernelSource>;
-    for (const [id, source] of allSources) {
-      if (!this.sentSources.has(id)) sources[id] = source;
+    let workerIndices: number[];
+    if (targetWorker === undefined) {
+      const activeWorkers = Math.max(
+        1,
+        Math.min(this.size, Math.ceil(job.total / job.chunk)),
+      );
+      workerIndices = Array.from({ length: activeWorkers }, (_, index) => index);
+    } else {
+      if (this.ports[targetWorker] === undefined) {
+        throw new RayonError(`target worker ${targetWorker} does not exist`);
+      }
+      workerIndices = [targetWorker];
     }
 
     Atomics.store(this.ctrl, CTRL.CURSOR, 0);
     Atomics.store(this.ctrl, CTRL.POSTED, 0);
     Atomics.store(this.ctrl, CTRL.ERR, 0);
 
-    const message: JobMessage = { ...job, type: "job", epoch, sources };
+    const publishedSources: Array<{
+      workerIndex: number;
+      sourceIds: KernelSourceId[];
+    }> = [];
     try {
-      if (targetWorker === undefined) {
-        for (const port of this.ports) port.postMessage(message);
-      } else {
-        const targetPort = this.ports[targetWorker];
-        if (targetPort === undefined) {
-          throw new RayonError(`target worker ${targetWorker} does not exist`);
+      for (const workerIndex of workerIndices) {
+        const sent = this.sentSources[workerIndex]!;
+        const sources = Object.create(null) as Record<KernelSourceId, KernelSource>;
+        for (const [id, source] of allSources) {
+          if (!sent.has(id)) sources[id] = source;
         }
-        const idleMessage: JobMessage = {
-          ...message,
-          total: 0,
-          sourceLen: 0,
-          input: null,
-          out: null,
+        const message: JobMessage = {
+          ...job,
+          type: "job",
+          epoch,
+          sources,
         };
-        // Publish clone-only idle messages first. If one fails, transfer-only
-        // partials have not yet been detached from the main thread.
-        for (let index = 0; index < this.ports.length; index++) {
-          if (index !== targetWorker) this.ports[index]!.postMessage(idleMessage);
-        }
-        targetPort.postMessage(message, transferList(message.input));
+        const port = this.ports[workerIndex]!;
+        if (targetWorker === undefined) port.postMessage(message);
+        else port.postMessage(message, transferList(message.input));
+        publishedSources.push({
+          workerIndex,
+          sourceIds: Object.keys(sources),
+        });
       }
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
@@ -464,20 +501,30 @@ export class Pool {
       epoch,
       deadline: Date.now() + timeoutMs,
       timeoutMs,
-      publishedSourceIds: Object.keys(sources),
+      workerIndices,
+      publishedSources,
     };
   }
 
-  private timeoutError(timeoutMs: number, posted: number, total: number): RayonTimeoutError {
+  private timeoutError(
+    timeoutMs: number,
+    posted: number,
+    expected: number,
+    total: number,
+  ): RayonTimeoutError {
     return new RayonTimeoutError(
-      `parallel job timed out after ${timeoutMs}ms (${posted}/${this.size} workers reported; ` +
+      `parallel job timed out after ${timeoutMs}ms (${posted}/${expected} active workers reported; ` +
         `cursor=${Atomics.load(this.ctrl, CTRL.CURSOR)}/${total}); the worker pool was discarded`,
     );
   }
 
-  private collectOrBreak(epoch: number, recordStats: boolean): ResultMessage[] {
+  private collectOrBreak(
+    epoch: number,
+    workerIndices: number[],
+    recordStats: boolean,
+  ): ResultMessage[] {
     try {
-      return this.collect(epoch, recordStats);
+      return this.collect(epoch, workerIndices, recordStats);
     } catch (cause) {
       if (!(cause instanceof KernelRuntimeError)) {
         this.breakPool(cause instanceof Error ? cause : new Error(String(cause)));
@@ -486,9 +533,14 @@ export class Pool {
     }
   }
 
-  private collect(epoch: number, recordStats: boolean): ResultMessage[] {
+  private collect(
+    epoch: number,
+    workerIndices: number[],
+    recordStats: boolean,
+  ): ResultMessage[] {
     const results: ResultMessage[] = [];
-    for (const port of this.ports) {
+    for (const workerIndex of workerIndices) {
+      const port = this.ports[workerIndex]!;
       let found: ResultMessage | undefined;
       let entry: ReturnType<typeof receiveMessageOnPort>;
       while ((entry = receiveMessageOnPort(port)) !== undefined) {
@@ -500,7 +552,7 @@ export class Pool {
       }
       if (found === undefined) {
         throw new RayonError(
-          "protocol violation: worker result missing after POSTED reached pool size",
+          "protocol violation: worker result missing after every active worker reported",
         );
       }
       results.push(found);
@@ -517,10 +569,32 @@ export class Pool {
     return results;
   }
 
+  private recordPublishedSources(
+    published: Array<{
+      workerIndex: number;
+      sourceIds: KernelSourceId[];
+    }>,
+  ): void {
+    for (const { workerIndex, sourceIds } of published) {
+      const sent = this.sentSources[workerIndex]!;
+      for (const id of sourceIds) sent.add(id);
+    }
+  }
+
   private throwIfBroken(): void {
     if (this.state !== "healthy") {
       throw this.failure ?? new RayonError(`worker pool is ${this.state}`);
     }
+  }
+
+  private throwIfWorkerExited(): void {
+    const threadId = Atomics.load(this.ctrl, CTRL.FATAL);
+    if (threadId === 0) return;
+    const error = new RayonError(
+      `worker thread ${threadId} exited before reporting its result; the pool was discarded`,
+    );
+    this.breakPool(error);
+    throw error;
   }
 
   private breakPool(cause: Error): void {

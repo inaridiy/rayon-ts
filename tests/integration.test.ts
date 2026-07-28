@@ -171,13 +171,88 @@ export function importedWork(x: number): number {
   return importedScale(x, 3) + basename(importedLabel(x)).length;
 }
 
-export const result = par.range(0, 10).map(importedWork).sum();
+const nameBonus = 2;
+export function importedNameLength(x: number): number {
+  "use parallel";
+  return basename(importedLabel(x)).length + nameBonus;
+}
+
+export function importedNameOnly(x: number): number {
+  "use parallel";
+  return basename(importedLabel(x)).length;
+}
+
+export const result = [
+  par.range(0, 10).map(importedWork).sum(),
+  par.range(0, 10).map(importedNameLength).sum(),
+  par.range(0, 10).map(importedNameOnly).sum(),
+];
 `);
     let expected = 0;
+    let expectedLength = 0;
     for (let i = 0; i < 10; i++) {
       expected += i * 3 + 7 + `value:${i}`.length;
+      expectedLength += `value:${i}`.length + 2;
     }
-    expect(mod.result).toBe(expected);
+    expect(mod.result).toEqual([
+      expected,
+      expectedLength,
+      expectedLength - 20,
+    ]);
+  });
+
+  it("shares imported module state between matching bundles in one worker", async () => {
+    const mod = await compileAndImport(`
+import { par } from "../../src/index.js";
+import { nextImportedCount } from "../fixtures/imported-math.js";
+
+function firstCount(): number {
+  "use parallel";
+  return nextImportedCount();
+}
+
+function secondCount(): number {
+  "use parallel";
+  return nextImportedCount();
+}
+
+export const result = [
+  par.range(0, 1).map(firstCount).sum(),
+  par.range(0, 1).map(secondCount).sum(),
+];
+`);
+    expect(mod.result).toEqual([1, 2]);
+  });
+
+  it("does not re-evaluate a shared bundle after a kernel error", async () => {
+    const mod = await compileAndImport(`
+import { par } from "../../src/index.js";
+import { nextImportedCount } from "../fixtures/imported-math.js";
+
+function failingCount(): number {
+  "use parallel";
+  const count = nextImportedCount();
+  throw new Error("expected failure at " + count);
+}
+
+function countAfterFailure(): number {
+  "use parallel";
+  return nextImportedCount();
+}
+
+let failed = false;
+try {
+  par.range(0, 1).map(failingCount).sum();
+} catch {
+  failed = true;
+}
+
+export const result = [
+  failed,
+  par.range(0, 1).map(countAfterFailure).sum(),
+];
+`);
+    expect(mod.result).toEqual([true, 2]);
   });
 
   it("maps and filters structured-clone object arrays with inferred result types", async () => {

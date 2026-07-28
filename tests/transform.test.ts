@@ -143,6 +143,69 @@ export function f(value: string): number {
     expect(out!.code).not.toContain("__env.basename");
   });
 
+  it("shares one imported-code bundle across kernels with the same imports", () => {
+    const out = t(`
+import { basename } from "node:path";
+export function first(value: string): string {
+  "use parallel";
+  return basename(value);
+}
+export function second(value: string): number {
+  "use parallel";
+  return basename(value).length;
+}
+`);
+    expect(out!.code.match(/const __rayon\$src\$\d+ =/g)).toHaveLength(1);
+    expect(out!.code).toContain(`factoryName: "kernel0"`);
+    expect(out!.code).toContain(`factoryName: "kernel1"`);
+    const ids = out!.code.match(/id: "mod\.ts::bundle@[a-f0-9]+"/g);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(1);
+  });
+
+  it("keeps kernels with unrelated imports in separate bundles", () => {
+    const out = t(`
+import { basename } from "node:path";
+import { fileURLToPath } from "node:url";
+export function first(value: string): string {
+  "use parallel";
+  return basename(value);
+}
+export function second(value: URL): string {
+  "use parallel";
+  return fileURLToPath(value);
+}
+`);
+    expect(out!.code.match(/const __rayon\$src\$\d+ =/g)).toHaveLength(2);
+    const ids = out!.code.match(/id: "mod\.ts::bundle@[a-f0-9]+"/g);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it("locates a bundle failure at the kernel with the bad import", () => {
+    const code = `
+import { basename } from "node:path";
+import { missing } from "./definitely-missing.js";
+export function valid(value: string): string {
+  "use parallel";
+  return basename(value);
+}
+export function invalid(value: string): unknown {
+  "use parallel";
+  return missing(value);
+}
+`;
+    try {
+      t(code);
+      throw new Error("expected the transform to fail");
+    } catch (cause) {
+      expect(cause).toBeInstanceOf(RayonTransformError);
+      const error = cause as RayonTransformError;
+      expect(error.diagnostics[0]?.start).toBe(code.indexOf("function invalid"));
+      expect(error.message).toContain("Could not resolve");
+    }
+  });
+
   it("can leave configured packages external to the worker bundle", () => {
     const out = transformModule(
       "/app/kernel.ts",

@@ -7,3 +7,10 @@ export function importedScale(value: number, factor: number): number {
 export function importedLabel(value: number): string {
   return `value:${value}`;
 }
+
+let counter = 0;
+
+export function nextImportedCount(): number {
+  counter += 1;
+  return counter;
+}

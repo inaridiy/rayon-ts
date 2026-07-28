@@ -765,10 +765,23 @@ function mergeResults(
       return merged;
     }
     case "collectValues": {
-      const segments: ValueSegment[] = results
-        .flatMap((result) => result.valueSegments ?? [])
-        .sort((a, b) => a.start - b.start);
-      return segments.flatMap((segment) => segment.values);
+      const segments: ValueSegment[] = [];
+      for (const result of results) {
+        if (result.valueSegments !== undefined) {
+          for (const segment of result.valueSegments) {
+            segments.push(segment);
+          }
+        }
+      }
+      segments.sort((a, b) => a.start - b.start);
+      let length = 0;
+      for (const segment of segments) length += segment.values.length;
+      const values: unknown[] = Array.from({ length });
+      let offset = 0;
+      for (const segment of segments) {
+        for (const value of segment.values) values[offset++] = value;
+      }
+      return values;
     }
     case "invoke": {
       const values: InvokeValue[] = results.flatMap((r) => r.values ?? []).sort((a, b) => a.index - b.index);

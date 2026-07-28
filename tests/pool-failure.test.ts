@@ -88,6 +88,38 @@ describe("worker-pool failure lifecycle", () => {
     expect(result).toEqual({ first: "RayonTimeoutError", second: 45 });
   });
 
+  it("detects a worker exit while the synchronous API is blocked", () => {
+    const result = runIsolated(`
+      (async () => {
+        const { initThreadPool, par, shutdownThreadPool } = await import("./src/index.ts");
+        const { __rayonRegister } = await import("./src/runtime/registry.ts");
+        initThreadPool({ threads: 2, timeoutMs: 5000, startupTimeoutMs: 5000 });
+        const exitWorker = __rayonRegister((x) => x, {
+          id: "isolated::exitWorker",
+          source: "(x) => { if (x === 0) process.exit(17); return x; }",
+          getEnv: () => ({})
+        });
+        const started = performance.now();
+        let first;
+        let message;
+        try { par.range(0, 2).map(exitWorker).sum(); }
+        catch (error) {
+          first = error.name;
+          message = error.message;
+        }
+        const elapsed = performance.now() - started;
+        const second = par.range(0, 10).sum();
+        await shutdownThreadPool();
+        console.log(JSON.stringify({ first, message, elapsed, second }));
+      })();
+    `);
+
+    expect(result.first).toBe("RayonError");
+    expect(result.message).toMatch(/worker thread .* exited/);
+    expect(result.elapsed).toBeLessThan(1000);
+    expect(result.second).toBe(45);
+  });
+
   it("rejects invalid configuration before creating workers", () => {
     const result = runIsolated(`
       (async () => {

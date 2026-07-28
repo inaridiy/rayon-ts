@@ -19,6 +19,12 @@ export const CTRL = {
   ERR: 3,
   /** Number of workers that finished booting. */
   READY: 4,
+  /**
+   * Thread id of a worker that began exiting without completing the pool
+   * lifecycle. Unlike parent-side Worker "exit" events, this remains visible
+   * while the main thread is blocked in Atomics.wait().
+   */
+  FATAL: 5,
 } as const;
 
 export const CTRL_LEN = 8;
@@ -70,6 +76,8 @@ export type EncodedNode =
 
 export interface KernelBindingSpec {
   sourceId: KernelSourceId;
+  /** Named factory inside a shared bundle; absent for a single expression. */
+  factoryName?: string;
   /** Root in the job-wide graphNodes table. */
   env: EncodedValue;
 }

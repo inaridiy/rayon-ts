@@ -33,9 +33,19 @@ import {
 } from "../runtime/protocol.js";
 import { markRayonWorker } from "../runtime/context.js";
 import { collectTransferables } from "../runtime/transfer.js";
+import { createChunkRunner } from "./chunk-runner.js";
 
 const ctrl = new Int32Array(workerData.ctrlSab as SharedArrayBuffer);
 const port = workerData.port as MessagePort;
+
+// Parent-side Worker "exit" callbacks cannot run while the synchronous API is
+// blocked in Atomics.wait(). Publish liveness from this thread itself so the
+// waiter can fail immediately instead of burning the full job timeout.
+process.once("exit", () => {
+  Atomics.compareExchange(ctrl, CTRL.FATAL, 0, threadId);
+  Atomics.notify(ctrl, CTRL.POSTED);
+  Atomics.notify(ctrl, CTRL.READY);
+});
 
 // Ambient thread id so kernels (which cannot import modules) can observe
 // which thread ran them. The main thread sets this to 0 for sequential runs.
@@ -44,14 +54,25 @@ markRayonWorker();
 
 type Kernel = (...args: unknown[]) => unknown;
 type KernelFactory = (env: Record<string, unknown>) => Kernel;
+type KernelFactoryExport = KernelFactory | Record<string, KernelFactory>;
 
-const factories = new Map<KernelSourceId, KernelFactory>();
+const factories = new Map<KernelSourceId, KernelFactoryExport>();
+// Binding ids are per runtime registration and can be short-lived (for
+// example, an inline kernel created inside a repeatedly called function).
+// Source/factory identity is the stable code location for an empty environment.
+const statelessKernels = new Map<
+  KernelSourceId,
+  Map<string | undefined, Kernel>
+>();
 
 function sourceUrl(id: string): string {
   return `rayon-kernel://${id.replace(/[\r\n\u2028\u2029]/g, "_")}`;
 }
 
-function makeFactory(id: KernelSourceId, source: KernelSource): KernelFactory {
+function makeFactory(
+  id: KernelSourceId,
+  source: KernelSource,
+): KernelFactoryExport {
   try {
     if (source.format === "bundle") {
       const workerRequire = createRequire(
@@ -62,8 +83,13 @@ function makeFactory(id: KernelSourceId, source: KernelSource): KernelFactory {
         "require",
         `"use strict";\n${source.code}\nreturn __rayonBundle.default;\n//# sourceURL=${sourceUrl(id)}`,
       )(workerRequire) as unknown;
-      if (typeof factory !== "function") throw new TypeError("bundle did not export a kernel factory");
-      return factory as KernelFactory;
+      if (
+        typeof factory !== "function" &&
+        (factory === null || typeof factory !== "object")
+      ) {
+        throw new TypeError("bundle did not export a kernel factory or factory map");
+      }
+      return factory as KernelFactoryExport;
     }
     // The expression has captured references rewritten to `__env.name`.
     // eslint-disable-next-line no-new-func
@@ -85,20 +111,61 @@ function instantiate(job: JobMessage): {
   const envObjs = new Map<KernelBindingId, Record<string, unknown>>();
   const fns = new Map<KernelBindingId, Kernel>();
   for (const bindingId of bindingIds) {
-    const sourceId = job.bindings[bindingId]!.sourceId;
-    const factory = factories.get(sourceId);
-    if (factory === undefined) throw new Error(`kernel source "${sourceId}" is missing in this worker`);
+    const binding = job.bindings[bindingId]!;
+    const sourceId = binding.sourceId;
+    const envNode =
+      binding.env !== null &&
+      typeof binding.env === "object" &&
+      binding.env.kind === "node"
+        ? job.graphNodes[binding.env.index]
+        : undefined;
+    const stateless =
+      envNode?.kind === "object" &&
+      envNode.entries.length === 0;
+    const cached = stateless
+      ? statelessKernels.get(sourceId)?.get(binding.factoryName)
+      : undefined;
+    if (cached !== undefined) {
+      fns.set(bindingId, cached);
+      continue;
+    }
+    const exported = factories.get(sourceId);
+    if (exported === undefined) throw new Error(`kernel source "${sourceId}" is missing in this worker`);
+    const factory =
+      binding.factoryName === undefined
+        ? exported
+        : typeof exported === "object"
+          ? exported[binding.factoryName]
+          : undefined;
+    if (typeof factory !== "function") {
+      throw new Error(
+        binding.factoryName === undefined
+          ? `kernel source "${sourceId}" did not export a factory`
+          : `kernel source "${sourceId}" has no factory named "${binding.factoryName}"`,
+      );
+    }
     const env: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     envObjs.set(bindingId, env);
-    fns.set(bindingId, factory(env));
+    const fn = factory(env);
+    fns.set(bindingId, fn);
+    if (stateless) {
+      let sourceKernels = statelessKernels.get(sourceId);
+      if (sourceKernels === undefined) {
+        sourceKernels = new Map();
+        statelessKernels.set(sourceId, sourceKernels);
+      }
+      sourceKernels.set(binding.factoryName, fn);
+    }
   }
   const decode = createGraphDecoder(job.graphNodes, fns);
   for (const bindingId of bindingIds) {
+    const envObj = envObjs.get(bindingId);
+    if (envObj === undefined) continue;
     const decoded = decode(job.bindings[bindingId]!.env);
     if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
       throw new Error(`kernel binding "${bindingId}" has an invalid environment`);
     }
-    Object.defineProperties(envObjs.get(bindingId)!, Object.getOwnPropertyDescriptors(decoded));
+    Object.defineProperties(envObj, Object.getOwnPropertyDescriptors(decoded));
   }
   const input =
     job.inputRoot === undefined
@@ -265,11 +332,15 @@ function postResult(result: ResultMessage): void {
 
 function runJob(job: JobMessage, result: ResultMessage): void {
   for (const [id, source] of Object.entries(job.sources)) {
-    factories.set(id, makeFactory(id, source));
+    // Main-side publication is acknowledged only after a successful result,
+    // so a kernel error may resend an already compiled source. Source ids are
+    // content identities: keep evaluation idempotent to preserve bundled
+    // module state. A makeFactory() failure never inserts and remains retryable.
+    if (!factories.has(id)) factories.set(id, makeFactory(id, source));
   }
   const { fns, input } = instantiate(job);
   const chain = job.chain.map((stage) => ({ kind: stage.kind, fn: fns.get(stage.bindingId)! }));
-  const { out, total, chunk, rangeStart, terminal, sourceLen, chunkLen } = job;
+  const { total, chunk, terminal } = job;
 
   let sum = 0;
   let min = Infinity;
@@ -280,6 +351,10 @@ function runJob(job: JobMessage, result: ResultMessage): void {
   const valueSegments: ValueSegment[] = [];
   const values: InvokeValue[] = [];
   const combine = terminal.kind === "fold" ? fns.get(terminal.combineBindingId)! : undefined;
+  const runChunk =
+    terminal.kind === "invoke"
+      ? undefined
+      : createChunkRunner(job, input, chain, combine);
   let processed = 0;
 
   while (true) {
@@ -298,79 +373,85 @@ function runJob(job: JobMessage, result: ResultMessage): void {
       continue;
     }
 
-    // A worker may claim multiple chunks. Each fold needs an independent
-    // identity so mutating associative reducers cannot alias across partials.
-    let foldAcc: unknown =
-      terminal.kind === "fold" ? freshReductionIdentity(terminal.identity) : 0;
-    const segment: number[] | null = terminal.kind === "collect" && terminal.filtered ? [] : null;
-    const valueSegment: unknown[] | null = terminal.kind === "collectValues" ? [] : null;
-
-    elements: for (let i = start; i < end; i++) {
-      let value: unknown;
-      if (chunkLen > 0) {
-        const cs = i * chunkLen;
-        const ce = Math.min(cs + chunkLen, sourceLen);
-        if (input === null) value = { start: rangeStart + cs, end: rangeStart + ce };
-        else if (Array.isArray(input)) value = input.slice(cs, ce);
-        else value = input.subarray(cs, ce);
-      } else {
-        value = input !== null ? input[i] : rangeStart + i;
+    switch (terminal.kind) {
+      case "forEach":
+        runChunk!(start, end, undefined);
+        break;
+      case "sum":
+        sum = runChunk!(start, end, sum) as number;
+        break;
+      case "min":
+        min = runChunk!(start, end, min) as number;
+        break;
+      case "max":
+        max = runChunk!(start, end, max) as number;
+        break;
+      case "count":
+        count = runChunk!(start, end, count) as number;
+        break;
+      case "fold": {
+        // A worker may claim multiple chunks. Each fold needs an independent
+        // identity so mutating reducers cannot alias across partials.
+        const identity = freshReductionIdentity(terminal.identity);
+        folds.push({ start, value: runChunk!(start, end, identity) });
+        break;
       }
-      for (const stage of chain) {
-        if (stage.kind === "map") {
-          value = stage.fn(value, i);
-        } else if (!stage.fn(value, i)) {
-          continue elements;
+      case "collect": {
+        if (!terminal.filtered) {
+          runChunk!(start, end, undefined);
+          break;
         }
+        const segment = runChunk!(start, end, undefined) as number[];
+        if (segment.length > 0) {
+          const buf = Float64Array.from(segment);
+          segments.push({
+            start,
+            buffer: buf.buffer as ArrayBuffer,
+            length: buf.length,
+          });
+        }
+        break;
       }
-      switch (terminal.kind) {
-        case "forEach":
-          break;
-        case "sum":
-          sum += value as number;
-          break;
-        case "min":
-          if ((value as number) < min) min = value as number;
-          break;
-        case "max":
-          if ((value as number) > max) max = value as number;
-          break;
-        case "count":
-          count += 1;
-          break;
-        case "fold":
-          foldAcc = combine!(foldAcc, value);
-          break;
-        case "collect":
-          if (segment !== null) segment.push(value as number);
-          else out![i] = value as number;
-          break;
-        case "collectValues":
-          valueSegment!.push(value);
-          break;
+      case "collectValues": {
+        const valueSegment = runChunk!(start, end, undefined) as unknown[];
+        if (valueSegment.length > 0) {
+          valueSegments.push({ start, values: valueSegment });
+        }
+        break;
       }
-    }
-
-    if (terminal.kind === "fold") folds.push({ start, value: foldAcc });
-    if (segment !== null && segment.length > 0) {
-      const buf = Float64Array.from(segment);
-      segments.push({ start, buffer: buf.buffer as ArrayBuffer, length: buf.length });
-    }
-    if (valueSegment !== null && valueSegment.length > 0) {
-      valueSegments.push({ start, values: valueSegment });
     }
     processed += end - start;
   }
 
   result.processed = processed;
-  result.sum = sum;
-  result.min = min;
-  result.max = max;
-  result.count = count;
-  result.folds = folds;
-  result.segments = segments;
-  result.valueSegments = valueSegments;
-  result.values = values;
+  switch (terminal.kind) {
+    case "forEach":
+      break;
+    case "sum":
+      result.sum = sum;
+      break;
+    case "min":
+      result.min = min;
+      break;
+    case "max":
+      result.max = max;
+      break;
+    case "count":
+      result.count = count;
+      break;
+    case "fold":
+      result.folds = folds;
+      break;
+    case "collect":
+      if (terminal.filtered) result.segments = segments;
+      break;
+    case "collectValues":
+      result.valueSegments = valueSegments;
+      break;
+    case "invoke":
+      result.values = values;
+      break;
+  }
 }
 
 function handleJob(job: JobMessage): void {

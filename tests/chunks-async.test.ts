@@ -71,6 +71,25 @@ describe("chunks()", () => {
     expect(total).toBe(expected);
   });
 
+  it("generic array chunks preserve values and the trailing partial slice", () => {
+    const chunkLabels = __rayonRegister(
+      (chunk: readonly { label: string }[]): string =>
+        chunk.map((item) => item.label).join(","),
+      {
+        id: "manual::genericChunkLabels",
+        source: "(chunk) => chunk.map((item) => item.label).join(',')",
+        getEnv: () => ({}),
+      },
+    );
+    const values = ["a", "b", "c", "d", "e"].map((label) => ({ label }));
+
+    expect(par(values).chunks(2).map(chunkLabels).toArray()).toEqual([
+      "a,b",
+      "c,d",
+      "e",
+    ]);
+  });
+
   it("canonicalizes Buffer chunks to Uint8Array across worker boundaries", () => {
     const data = Buffer.from(new SharedArrayBuffer(8));
     expect(par(data).chunks(2).map(isBufferChunk).sum()).toBe(0);

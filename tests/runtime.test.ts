@@ -204,6 +204,20 @@ describe("map / collect / forEach", () => {
     }
   });
 
+  it("falls back safely for unusually deep iterator pipelines", () => {
+    const identity = __rayonRegister((value: number): number => value, {
+      id: "manual::deepPipelineIdentity",
+      source: "(value) => value",
+      getEnv: () => ({}),
+    });
+    let pipeline = par.range(0, 100).map(identity);
+    for (let stage = 1; stage < 65; stage++) {
+      pipeline = pipeline.map(identity);
+    }
+
+    expect(pipeline.filter(isEven).sum()).toBe(2450);
+  });
+
   it("iterates shared typed arrays zero-copy", () => {
     const data = shared.f64(N);
     for (let i = 0; i < N; i++) data[i] = i;
@@ -425,6 +439,48 @@ describe("map / collect / forEach", () => {
     expect(threadsUsed).toBeGreaterThan(1);
     expect(result.every((value) => value.self === value)).toBe(true);
     expect(new Set(result).size).toBe(threadsUsed);
+  });
+
+  it("reuses a kernel after growing from one active worker to the full pool", () => {
+    const identifyThread = __rayonRegister(
+      (_value: number): number => RAYON_THREAD_ID,
+      {
+        id: "manual::activeWorkerSourceCache",
+        source: `(_value) => {
+          let total = 0;
+          for (let index = 0; index < 100000; index++) total += index;
+          if (total < 0) throw new Error("unreachable");
+          return RAYON_THREAD_ID;
+        }`,
+        getEnv: () => ({}),
+      },
+    );
+
+    expect(par.range(0, 1).map(identifyThread).toArray()).toHaveLength(1);
+    expect(rayonStats()?.threadsUsed).toBe(1);
+
+    const threads = new Set(
+      par.range(0, 64).withMaxLen(1).map(identifyThread).toArray(),
+    );
+    expect(threads.size).toBeGreaterThan(1);
+    expect(rayonStats()?.threadsUsed).toBe(threads.size);
+  });
+
+  it("reuses a stateless worker kernel across registrations from one source site", () => {
+    const source = `(() => {
+      globalThis.__rayonStatelessInstantiations =
+        (globalThis.__rayonStatelessInstantiations ?? 0) + 1;
+      return (_value) => globalThis.__rayonStatelessInstantiations;
+    })()`;
+    const register = () =>
+      __rayonRegister((_value: number): number => 0, {
+        id: "manual::statelessSourceSite",
+        source,
+        getEnv: () => ({}),
+      });
+
+    expect(par.range(0, 1).map(register()).sum()).toBe(1);
+    expect(par.range(0, 1).map(register()).sum()).toBe(1);
   });
 
   it("collects structured-clone objects with collect(Array)", async () => {

@@ -25,6 +25,16 @@ export interface TransformResult {
   map: Record<string, unknown>;
 }
 
+interface CompiledKernel {
+  source: KernelSource;
+  factoryName?: string;
+}
+
+interface EmittedSource {
+  hash: string;
+  srcConst: string;
+}
+
 export class RayonTransformError extends Error {
   override name = "RayonTransformError";
   readonly diagnostics: Diagnostic[];
@@ -65,15 +75,14 @@ function kernelExt(filename: string): string {
 
 /** Applies `__env.` rewrites to the kernel slice (offsets relative to slice). */
 function rewriteCaptures(slice: string, kernel: KernelAnalysis): string {
-  let out = slice;
-  for (let i = kernel.rewrites.length - 1; i >= 0; i--) {
-    const site = kernel.rewrites[i]!;
+  const rewritten = new MagicString(slice);
+  for (const site of kernel.rewrites) {
     const start = site.start - kernel.start;
     const end = site.end - kernel.start;
     const replacement = site.shorthand ? `${site.name}: __env.${site.name}` : `__env.${site.name}`;
-    out = out.slice(0, start) + replacement + out.slice(end);
+    rewritten.overwrite(start, end, replacement);
   }
-  return out;
+  return rewritten.toString();
 }
 
 /** Strips TypeScript types from a rewritten kernel expression. */
@@ -158,22 +167,19 @@ function aliasPlugin(aliases: readonly ImportAlias[]): EsbuildPlugin {
   };
 }
 
-function bundleOptions(
-  filename: string,
+function importDeclarations(
   code: string,
-  kernel: KernelAnalysis,
-  rewritten: string,
-  ext: string,
+  kernels: readonly KernelAnalysis[],
   aliases: readonly ImportAlias[],
-  external: readonly string[],
-  plugins: EsbuildPlugin[],
-): BuildOptions {
-  const declarations = [
+): string[] {
+  return [
     ...new Map(
-      kernel.imports.map((binding) => [
-        binding.declarationStart,
-        binding,
-      ]),
+      kernels.flatMap((kernel) =>
+        kernel.imports.map((binding) => [
+          binding.declarationStart,
+          binding,
+        ] as const),
+      ),
     ).values(),
   ].map((binding) => {
     const declaration = code.slice(
@@ -189,16 +195,15 @@ function bundleOptions(
       declaration.slice(sourceEnd)
     );
   });
-  const factoryName = freshIdentifier(
-    "__rayonFactory",
-    `${declarations.join("\n")}\n${rewritten}`,
-    new Set(),
-  );
-  const entry = [
-    ...declarations,
-    `const ${factoryName} = (__env) => (${rewritten});`,
-    `export default ${factoryName};`,
-  ].join("\n");
+}
+
+function bundleBuildOptions(
+  filename: string,
+  entry: string,
+  ext: string,
+  external: readonly string[],
+  plugins: EsbuildPlugin[],
+): BuildOptions {
   const absolute = path.resolve(filename.split("?")[0]!);
   return {
     stdin: {
@@ -232,59 +237,112 @@ function bundleError(cause: unknown): never {
   throw new Error(`cannot bundle imports used by this kernel: ${detail}`);
 }
 
-function bundledFactorySync(
-  filename: string,
+function groupBundleEntry(
   code: string,
-  kernel: KernelAnalysis,
-  rewritten: string,
-  ext: string,
+  kernels: readonly KernelAnalysis[],
+  rewritten: readonly string[],
   aliases: readonly ImportAlias[],
-  external: readonly string[],
-): KernelSource {
+): {
+  entry: string;
+  factoryNames: string[];
+} {
+  const declarations = importDeclarations(code, kernels, aliases);
+  const combined = `${declarations.join("\n")}\n${rewritten.join("\n")}`;
+  const factoryPrefix = freshIdentifier(
+    "__rayonFactory$",
+    combined,
+    new Set(),
+  );
+  const variables = kernels.map((_kernel, index) =>
+    `${factoryPrefix}${index}`,
+  );
+  const factoryNames = kernels.map((_kernel, index) => `kernel${index}`);
+  const factories = rewritten.map(
+    (source, index) =>
+      `const ${variables[index]!} = (__env) => (${source});`,
+  );
+  const exported = factoryNames
+    .map(
+      (factoryName, index) =>
+        `${JSON.stringify(factoryName)}: ${variables[index]!}`,
+    )
+    .join(",\n");
+  return {
+    entry: [
+      ...declarations,
+      ...factories,
+      `export default {\n${exported}\n};`,
+    ].join("\n"),
+    factoryNames,
+  };
+}
+
+interface BundledGroup {
+  source: KernelSource;
+  factoryNames: string[];
+}
+
+interface BundleRequest {
+  filename: string;
+  code: string;
+  kernels: readonly KernelAnalysis[];
+  rewritten: readonly string[];
+  ext: string;
+  aliases: readonly ImportAlias[];
+  external: readonly string[];
+}
+
+function bundledGroupSync(request: BundleRequest): BundledGroup {
+  const { filename, code, kernels, rewritten, ext, aliases, external } = request;
+  const { entry, factoryNames } = groupBundleEntry(
+    code,
+    kernels,
+    rewritten,
+    aliases,
+  );
   try {
-    return bundledSource(
-      buildSync(
-        bundleOptions(
-          filename,
-          code,
-          kernel,
-          rewritten,
-          ext,
-          aliases,
-          external,
-          [],
+    return {
+      source: bundledSource(
+        buildSync(
+          bundleBuildOptions(
+            filename,
+            entry,
+            ext,
+            external,
+            [],
+          ),
         ),
       ),
-    );
+      factoryNames,
+    };
   } catch (cause) {
     return bundleError(cause);
   }
 }
 
-async function bundledFactoryAsync(
-  filename: string,
-  code: string,
-  kernel: KernelAnalysis,
-  rewritten: string,
-  ext: string,
-  aliases: readonly ImportAlias[],
-  external: readonly string[],
-): Promise<KernelSource> {
+async function bundledGroupAsync(request: BundleRequest): Promise<BundledGroup> {
+  const { filename, code, kernels, rewritten, ext, aliases, external } = request;
+  const { entry, factoryNames } = groupBundleEntry(
+    code,
+    kernels,
+    rewritten,
+    aliases,
+  );
   try {
-    return bundledSource(
-      await build(
-        bundleOptions(
-          filename,
-          code,
-          kernel,
-          rewritten,
-          ext,
-          aliases,
-          external,
-          aliases.length === 0 ? [] : [aliasPlugin(aliases)],
+    return {
+      source: bundledSource(
+        await build(
+          bundleBuildOptions(
+            filename,
+            entry,
+            ext,
+            external,
+            aliases.length === 0 ? [] : [aliasPlugin(aliases)],
+          ),
         ),
       ),
-    );
+      factoryNames,
+    };
   } catch (cause) {
     return bundleError(cause);
   }
@@ -375,11 +433,13 @@ function kernelTransformError(
 
 function finishTransform(
   prepared: PreparedTransform,
-  workerSources: readonly KernelSource[],
+  compiledKernels: readonly CompiledKernel[],
 ): TransformResult {
   const { filename, code, options, kernels, headerEnd } = prepared;
   const ms = new MagicString(code);
   const usedNames = new Set<string>();
+  const sourcesByIdentity = new WeakMap<KernelSource, EmittedSource>();
+  const sourcesByContent = new Map<string, EmittedSource>();
   const register = freshIdentifier("__rayon$register", code, usedNames);
   const header: string[] = [
     `import { __rayonRegister as ${register} } from ${JSON.stringify(options.runtimeModule ?? "rayon-ts/runtime")};`,
@@ -387,24 +447,45 @@ function finishTransform(
   const scopedRegistrations = new Map<number, string[]>();
 
   kernels.forEach((kernel, index) => {
-    const workerSource = workerSources[index];
-    if (workerSource === undefined) {
+    const compiled = compiledKernels[index];
+    if (compiled === undefined) {
       throw new Error(`internal: worker source #${index} is missing`);
     }
-    const hash = createHash("sha256")
-      .update(workerSource.format)
-      .update("\0")
-      .update(workerSource.code)
-      .digest("hex")
-      .slice(0, 16);
+    const { source: workerSource, factoryName } = compiled;
+    let emittedSource = sourcesByIdentity.get(workerSource);
+    if (emittedSource === undefined) {
+      const sourceKey = `${workerSource.format}\0${workerSource.code}`;
+      emittedSource = sourcesByContent.get(sourceKey);
+      if (emittedSource === undefined) {
+        emittedSource = {
+          hash: createHash("sha256")
+            .update(workerSource.format)
+            .update("\0")
+            .update(workerSource.code)
+            .digest("hex")
+            .slice(0, 16),
+          srcConst: freshIdentifier(`__rayon$src$${index}`, code, usedNames),
+        };
+        sourcesByContent.set(sourceKey, emittedSource);
+        header.push(
+          `const ${emittedSource.srcConst} = ${JSON.stringify(workerSource)};`,
+        );
+      }
+      sourcesByIdentity.set(workerSource, emittedSource);
+    }
+    const { hash, srcConst } = emittedSource;
     const name = kernel.name ?? `anon${index}`;
-    const id = `${options.moduleName}::${name}@${hash}`;
-    const srcConst = freshIdentifier(`__rayon$src$${index}`, code, usedNames);
-    header.push(`const ${srcConst} = ${JSON.stringify(workerSource)};`);
+    const id =
+      factoryName === undefined
+        ? `${options.moduleName}::${name}@${hash}`
+        : `${options.moduleName}::bundle@${hash}`;
 
     const env = `() => ({ ${kernel.captured.join(", ")} })`;
     const meta =
       `{ id: ${JSON.stringify(id)}, source: ${srcConst}, ` +
+      (factoryName === undefined
+        ? ""
+        : `factoryName: ${JSON.stringify(factoryName)}, `) +
       `resolveFrom: import.meta.url, getEnv: ${env} }`;
 
     if (kernel.kind === "declaration") {
@@ -453,68 +534,218 @@ function rewrittenKernel(
   );
 }
 
-function compileKernelSync(
-  prepared: PreparedTransform,
-  kernel: KernelAnalysis,
-): KernelSource {
-  const rewritten = rewrittenKernel(prepared, kernel);
-  const expression =
-    kernel.imports.length === 0
-      ? expressionSource(prepared, rewritten)
-      : undefined;
-  return expression ??
-    bundledFactorySync(
-        prepared.filename,
-        prepared.code,
-        kernel,
-        rewritten,
-        prepared.ext,
-        prepared.options.aliases ?? [],
-        prepared.options.external ?? [],
-      );
+interface KernelCandidate {
+  kernel: KernelAnalysis;
+  rewritten: string;
+  expression: KernelSource | undefined;
 }
 
-async function compileKernelAsync(
-  prepared: PreparedTransform,
-  kernel: KernelAnalysis,
-): Promise<KernelSource> {
-  const rewritten = rewrittenKernel(prepared, kernel);
-  const expression =
-    kernel.imports.length === 0
-      ? expressionSource(prepared, rewritten)
-      : undefined;
-  return expression ??
-    bundledFactoryAsync(
-        prepared.filename,
-        prepared.code,
-        kernel,
-        rewritten,
-        prepared.ext,
-        prepared.options.aliases ?? [],
-        prepared.options.external ?? [],
-      );
+interface KernelCompilation {
+  candidates: KernelCandidate[];
+  bundleGroups: KernelCandidate[][];
 }
 
-function compileKernelGuarded(
+function prepareKernelCandidate(
   prepared: PreparedTransform,
   kernel: KernelAnalysis,
-): KernelSource {
+): KernelCandidate {
   try {
-    return compileKernelSync(prepared, kernel);
+    const rewritten = rewrittenKernel(prepared, kernel);
+    return {
+      kernel,
+      rewritten,
+      expression:
+        kernel.imports.length === 0
+          ? expressionSource(prepared, rewritten)
+          : undefined,
+    };
   } catch (cause) {
     return kernelTransformError(prepared, kernel, cause);
   }
 }
 
-async function compileKernelGuardedAsync(
+function prepareKernelCompilation(
   prepared: PreparedTransform,
-  kernel: KernelAnalysis,
-): Promise<KernelSource> {
-  try {
-    return await compileKernelAsync(prepared, kernel);
-  } catch (cause) {
-    return kernelTransformError(prepared, kernel, cause);
+): KernelCompilation {
+  const candidates = prepared.kernels.map((kernel) =>
+    prepareKernelCandidate(prepared, kernel),
+  );
+  const groups = new Map<string, KernelCandidate[]>();
+  candidates.forEach((candidate, index) => {
+    if (candidate.expression !== undefined) return;
+    const declarations = [
+      ...new Set(
+        candidate.kernel.imports.map((binding) => binding.declarationStart),
+      ),
+    ].sort((first, second) => first - second);
+    // Syntax-lowering-only bundles have no dependency code to share. Keeping
+    // them separate avoids eagerly compiling unrelated kernels.
+    const key =
+      declarations.length === 0
+        ? `lowered:${index}`
+        : `imports:${declarations.join(",")}`;
+    const group = groups.get(key) ?? [];
+    group.push(candidate);
+    groups.set(key, group);
+  });
+  return {
+    candidates,
+    bundleGroups: [...groups.values()],
+  };
+}
+
+function bundleRequest(
+  prepared: PreparedTransform,
+  candidates: readonly KernelCandidate[],
+): BundleRequest {
+  return {
+    filename: prepared.filename,
+    code: prepared.code,
+    kernels: candidates.map((candidate) => candidate.kernel),
+    rewritten: candidates.map((candidate) => candidate.rewritten),
+    ext: prepared.ext,
+    aliases: prepared.options.aliases ?? [],
+    external: prepared.options.external ?? [],
+  };
+}
+
+interface CompiledBundleGroup {
+  candidates: readonly KernelCandidate[];
+  bundled: BundledGroup;
+}
+
+function combineCompiledKernels(
+  candidates: readonly KernelCandidate[],
+  groups: readonly CompiledBundleGroup[],
+): CompiledKernel[] {
+  const grouped = new Map<KernelCandidate, CompiledKernel>();
+  for (const { candidates: groupCandidates, bundled } of groups) {
+    groupCandidates.forEach((candidate, index) => {
+      const factoryName = bundled.factoryNames[index];
+      if (factoryName === undefined) {
+        throw new Error("internal: grouped kernel factory is missing");
+      }
+      grouped.set(candidate, { source: bundled.source, factoryName });
+    });
   }
+  return candidates.map((candidate) => {
+    const { expression } = candidate;
+    if (expression !== undefined) return { source: expression };
+    const compiled = grouped.get(candidate);
+    if (compiled === undefined) {
+      throw new Error("internal: grouped kernel bundle is incomplete");
+    }
+    return compiled;
+  });
+}
+
+type BundleOutcome =
+  | { ok: true; value: BundledGroup }
+  | { ok: false; cause: unknown };
+
+function attemptBundleSync(request: BundleRequest): BundleOutcome {
+  try {
+    return { ok: true, value: bundledGroupSync(request) };
+  } catch (cause) {
+    return { ok: false, cause };
+  }
+}
+
+async function attemptBundleAsync(
+  request: BundleRequest,
+): Promise<BundleOutcome> {
+  try {
+    return { ok: true, value: await bundledGroupAsync(request) };
+  } catch (cause) {
+    return { ok: false, cause };
+  }
+}
+
+function resolveBundleCompilation(
+  prepared: PreparedTransform,
+  candidates: readonly KernelCandidate[],
+  groupOutcome: BundleOutcome,
+  individualOutcomes: readonly BundleOutcome[],
+): BundledGroup {
+  if (groupOutcome.ok) return groupOutcome.value;
+  for (let index = 0; index < individualOutcomes.length; index++) {
+    const outcome = individualOutcomes[index];
+    const candidate = candidates[index];
+    if (outcome !== undefined && !outcome.ok && candidate !== undefined) {
+      return kernelTransformError(prepared, candidate.kernel, outcome.cause);
+    }
+  }
+  const first = candidates[0];
+  if (first === undefined) {
+    throw new Error("internal: failed a bundle with no grouped kernels");
+  }
+  return kernelTransformError(prepared, first.kernel, groupOutcome.cause);
+}
+
+function compileBundleGroupSync(
+  prepared: PreparedTransform,
+  candidates: readonly KernelCandidate[],
+): BundledGroup {
+  const groupOutcome = attemptBundleSync(
+    bundleRequest(prepared, candidates),
+  );
+  const individualOutcomes = groupOutcome.ok
+    ? []
+    : candidates.map((candidate) =>
+        attemptBundleSync(bundleRequest(prepared, [candidate])),
+      );
+  return resolveBundleCompilation(
+    prepared,
+    candidates,
+    groupOutcome,
+    individualOutcomes,
+  );
+}
+
+async function compileBundleGroupAsync(
+  prepared: PreparedTransform,
+  candidates: readonly KernelCandidate[],
+): Promise<BundledGroup> {
+  const groupOutcome = await attemptBundleAsync(
+    bundleRequest(prepared, candidates),
+  );
+  const individualOutcomes = groupOutcome.ok
+    ? []
+    : await Promise.all(
+        candidates.map((candidate) =>
+          attemptBundleAsync(bundleRequest(prepared, [candidate])),
+        ),
+      );
+  return resolveBundleCompilation(
+    prepared,
+    candidates,
+    groupOutcome,
+    individualOutcomes,
+  );
+}
+
+function compileKernelsSync(
+  prepared: PreparedTransform,
+): CompiledKernel[] {
+  const compilation = prepareKernelCompilation(prepared);
+  const groups = compilation.bundleGroups.map((candidates) => ({
+    candidates,
+    bundled: compileBundleGroupSync(prepared, candidates),
+  }));
+  return combineCompiledKernels(compilation.candidates, groups);
+}
+
+async function compileKernelsAsync(
+  prepared: PreparedTransform,
+): Promise<CompiledKernel[]> {
+  const compilation = prepareKernelCompilation(prepared);
+  const groups = await Promise.all(
+    compilation.bundleGroups.map(async (candidates) => ({
+      candidates,
+      bundled: await compileBundleGroupAsync(prepared, candidates),
+    })),
+  );
+  return combineCompiledKernels(compilation.candidates, groups);
 }
 
 /**
@@ -528,12 +759,7 @@ export function transformModule(
 ): TransformResult | null {
   const prepared = prepareTransform(filename, code, options);
   if (prepared === null) return null;
-  return finishTransform(
-    prepared,
-    prepared.kernels.map((kernel) =>
-      compileKernelGuarded(prepared, kernel),
-    ),
-  );
+  return finishTransform(prepared, compileKernelsSync(prepared));
 }
 
 /** Async Vite transform with direct and transitive resolve.alias support. */
@@ -544,10 +770,5 @@ export async function transformModuleAsync(
 ): Promise<TransformResult | null> {
   const prepared = prepareTransform(filename, code, options);
   if (prepared === null) return null;
-  const workerSources = await Promise.all(
-    prepared.kernels.map((kernel) =>
-      compileKernelGuardedAsync(prepared, kernel),
-    ),
-  );
-  return finishTransform(prepared, workerSources);
+  return finishTransform(prepared, await compileKernelsAsync(prepared));
 }
