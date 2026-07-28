@@ -11,7 +11,15 @@
     "isolatedModules": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    // Self-name imports in examples/ and tests/fixtures/ must typecheck from
+    // source on a fresh clone; dist declarations are validated separately by
+    // tests/compat after a build.
+    "paths": {
+      "rayon-ts": ["./src/index.ts"],
+      "rayon-ts/vite": ["./src/plugin/index.ts"],
+      "rayon-ts/runtime": ["./src/runtime/registry.ts"]
+    }
   },
   "include": ["src", "tests", "examples/**/*.ts", "vitest.config.ts"],
   "exclude": ["tests/.tmp", "tests/compat", "examples/**/dist"]
