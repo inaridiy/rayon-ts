@@ -349,12 +349,15 @@ export class ParIter<T = number> {
       sources,
       graphNodes,
       inputRoot,
+      rawInput,
     } = encodeKernelGraph(
       roots,
       this.source.kind === "serialized" ? this.source.data : undefined,
     );
 
-    let input: TypedArray | unknown[] | null = null;
+    // rawInput is the dispatch-time snapshot; postMessage clones it once per
+    // worker without the graph's node table.
+    let input: TypedArray | unknown[] | null = rawInput ?? null;
     let rangeStart = 0;
     if (this.source.kind === "array") {
       input = this.source.data;

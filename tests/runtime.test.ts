@@ -14,7 +14,7 @@ import {
   KernelRuntimeError,
 } from "../src/runtime/errors.js";
 import { claimWork, CTRL, CTRL_LEN } from "../src/runtime/protocol.js";
-import { __rayonRegister } from "../src/runtime/registry.js";
+import { __rayonRegister, encodeKernelGraph, kernelOf } from "../src/runtime/registry.js";
 import {
   add,
   fib,
@@ -343,6 +343,58 @@ describe("map / collect / forEach", () => {
     );
 
     expect(par([token]).map(isCaptured).sum()).toBe(1);
+  });
+
+  it("sends plain generic input raw and graph-encodes only when required", () => {
+    const token = { id: 1 };
+    const aliasing = __rayonRegister(
+      (value: { id: number }): number => (value === token ? 1 : 0),
+      {
+        id: "manual::fastPathAliasProbe",
+        source: "(value) => value === __env.token ? 1 : 0",
+        getEnv: () => ({ token }),
+      },
+    );
+    const info = kernelOf(aliasing)!;
+
+    const plain = encodeKernelGraph([info], [{ id: 2 }, { nested: [new Date(0)] }]);
+    expect(plain.inputRoot).toBeUndefined();
+    expect(plain.rawInput).toHaveLength(2);
+    // rawInput is the dispatch snapshot, not the caller's live objects.
+    expect(plain.rawInput![0]).toEqual({ id: 2 });
+
+    const aliased = encodeKernelGraph([info], [token]);
+    expect(aliased.rawInput).toBeUndefined();
+    expect(aliased.inputRoot).toBeDefined();
+
+    const nullProto = encodeKernelGraph([info], [Object.create(null) as object]);
+    expect(nullProto.rawInput).toBeUndefined();
+    expect(nullProto.inputRoot).toBeDefined();
+  });
+
+  it("preserves null-prototype input objects through generic dispatch", () => {
+    const record = Object.assign(Object.create(null) as { v?: number }, { v: 41 });
+    const probe = __rayonRegister(
+      (value: { v: number }): number =>
+        Object.getPrototypeOf(value) === null ? value.v + 1 : -1,
+      {
+        id: "manual::nullProtoProbe",
+        source: "(value) => Object.getPrototypeOf(value) === null ? value.v + 1 : -1",
+        getEnv: () => ({}),
+      },
+    );
+    expect(par([record]).map(probe).sum()).toBe(42);
+  });
+
+  it("rejects plain functions in generic input with a located error", () => {
+    const identity = __rayonRegister((value: unknown): unknown => value, {
+      id: "manual::fastPathFnInput",
+      source: "(value) => value",
+      getEnv: () => ({}),
+    });
+    expect(() => par([{ handler: () => 1 }]).map(identity).toArray()).toThrow(
+      /function "handler" appears at input\["0"\]\.handler/,
+    );
   });
 
   it("preserves each element graph without promising aliases across workers", () => {

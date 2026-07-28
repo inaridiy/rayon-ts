@@ -1,6 +1,6 @@
 {
   "name": "rayon-ts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Rayon-like data parallelism for Node.js: a Vite plugin that compiles \"use parallel\" functions to worker_threads kernels with SharedArrayBuffer + Atomics",
   "type": "module",
   "license": "MIT",
